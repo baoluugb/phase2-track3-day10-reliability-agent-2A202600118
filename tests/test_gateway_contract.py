@@ -5,9 +5,14 @@ from reliability_lab.providers import FakeLLMProvider
 
 
 def test_gateway_returns_response_with_route_reason() -> None:
-    provider = FakeLLMProvider("primary", fail_rate=0.0, base_latency_ms=1, cost_per_1k_tokens=0.001)
-    breaker = CircuitBreaker("primary", failure_threshold=2, reset_timeout_seconds=1)
-    gateway = ReliabilityGateway([provider], {"primary": breaker}, ResponseCache(60, 0.5))
+    provider = FakeLLMProvider(
+        "primary", fail_rate=0.0, base_latency_ms=1, cost_per_1k_tokens=0.001)
+    breaker = CircuitBreaker(
+        "primary", failure_threshold=2, reset_timeout_seconds=1)
+    gateway = ReliabilityGateway(
+        [provider], {"primary": breaker}, ResponseCache(60, 0.5))
     result = gateway.complete("hello world")
     assert result.text
-    assert result.route in {"primary", "fallback", "static_fallback"}
+    route_kind = result.route.split(":", 1)[0]
+    assert route_kind in {"primary", "fallback",
+                          "static_fallback", "cache_hit"}

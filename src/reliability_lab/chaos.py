@@ -25,8 +25,10 @@ def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
 def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None = None) -> ReliabilityGateway:
     providers = []
     for p in config.providers:
-        fail_rate = provider_overrides.get(p.name, p.fail_rate) if provider_overrides else p.fail_rate
-        providers.append(FakeLLMProvider(p.name, fail_rate, p.base_latency_ms, p.cost_per_1k_tokens))
+        fail_rate = provider_overrides.get(
+            p.name, p.fail_rate) if provider_overrides else p.fail_rate
+        providers.append(FakeLLMProvider(p.name, fail_rate,
+                         p.base_latency_ms, p.cost_per_1k_tokens))
     breakers = {
         p.name: CircuitBreaker(
             name=p.name,
@@ -45,7 +47,8 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
                 config.cache.similarity_threshold,
             )
         else:
-            cache = ResponseCache(config.cache.ttl_seconds, config.cache.similarity_threshold)
+            cache = ResponseCache(config.cache.ttl_seconds,
+                                  config.cache.similarity_threshold)
     return ReliabilityGateway(providers, breakers, cache)
 
 
@@ -77,15 +80,17 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     for _ in range(request_count):
         prompt = random.choice(queries)
         result = gateway.complete(prompt)
+        route_kind = result.route.split(":", 1)[0]
         metrics.total_requests += 1
         metrics.estimated_cost += result.estimated_cost
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+            metrics.successful_requests += 1
+        elif route_kind == "fallback":
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
-        elif result.route == "static_fallback":
+        elif route_kind == "static_fallback":
             metrics.static_fallbacks += 1
             metrics.failed_requests += 1
         else:
@@ -107,20 +112,29 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     Extend with your own custom scenarios (e.g., cost cap near limit).
     """
     if not config.scenarios:
-        default_scenario = ScenarioConfig(name="default", description="baseline run")
+        default_scenario = ScenarioConfig(
+            name="default", description="baseline run")
         metrics = run_scenario(config, queries, default_scenario)
-        metrics.scenarios = {"default": "pass" if metrics.successful_requests > 0 else "fail"}
+        metrics.scenarios = {
+            "default": "pass" if metrics.successful_requests > 0 else "fail"}
         return metrics
 
     combined = RunMetrics()
-    for scenario in config.scenarios:
-        result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
-        combined.scenarios[scenario.name] = "pass" if passed else "fail"
+    def evaluate_scenario(name: str, result: RunMetrics) -> bool:
+        if name == "primary_timeout_100":
+            return result.fallback_success_rate >= 0.9 and result.failed_requests < result.total_requests
+        if name == "primary_flaky_50":
+            return result.circuit_open_count > 0 and result.successful_requests > 0
+        if name == "all_healthy":
+            return result.error_rate <= 0.1
+        if name == "cache_disabled":
+            return result.cache_hit_rate == 0.0 and result.successful_requests > 0
+        return result.successful_requests > 0
 
+    def merge_result(name: str, result: RunMetrics) -> None:
+        passed = evaluate_scenario(name, result)
+        combined.scenarios[name] = "pass" if passed else "fail"
         combined.total_requests += result.total_requests
         combined.successful_requests += result.successful_requests
         combined.failed_requests += result.failed_requests
@@ -135,6 +149,19 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
             if combined.recovery_time_ms is None:
                 combined.recovery_time_ms = result.recovery_time_ms
             else:
-                combined.recovery_time_ms = (combined.recovery_time_ms + result.recovery_time_ms) / 2
+                combined.recovery_time_ms = (
+                    combined.recovery_time_ms + result.recovery_time_ms) / 2
+
+    for scenario in config.scenarios:
+        result = run_scenario(config, queries, scenario)
+        merge_result(scenario.name, result)
+
+    if config.cache.enabled and "cache_disabled" not in combined.scenarios:
+        no_cache_config = copy.deepcopy(config)
+        no_cache_config.cache.enabled = False
+        no_cache_scenario = ScenarioConfig(
+            name="cache_disabled", description="cache disabled baseline")
+        result = run_scenario(no_cache_config, queries, no_cache_scenario)
+        merge_result(no_cache_scenario.name, result)
 
     return combined

@@ -53,13 +53,21 @@ class ResponseCache:
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self._entries: list[CacheEntry] = []
+        self.false_hit_log: list[dict[str, object]] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
+        if _is_uncacheable(query):
+            return None, 0.0
         best_value: str | None = None
         best_score = 0.0
         now = time.time()
-        self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
+        self._entries = [e for e in self._entries if now -
+                         e.created_at <= self.ttl_seconds]
         for entry in self._entries:
+            if _looks_like_false_hit(query, entry.key):
+                self.false_hit_log.append(
+                    {"query": query, "cached_query": entry.key, "reason": "year_mismatch"})
+                continue
             score = self.similarity(query, entry.key)
             if score > best_score:
                 best_score = score
@@ -69,7 +77,10 @@ class ResponseCache:
         return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
-        self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
+        if _is_uncacheable(query):
+            return
+        self._entries.append(CacheEntry(
+            query, value, time.time(), metadata or {}))
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
@@ -77,11 +88,33 @@ class ResponseCache:
 
         TODO(student): Improve with embeddings or a deterministic vectorizer.
         """
-        left = set(a.lower().split())
-        right = set(b.lower().split())
-        if not left or not right:
+        norm_a = ResponseCache._normalize(a)
+        norm_b = ResponseCache._normalize(b)
+        if norm_a == norm_b:
+            return 1.0
+        left_tokens = set(norm_a.split())
+        right_tokens = set(norm_b.split())
+        token_score = 0.0
+        if left_tokens and right_tokens:
+            token_score = len(left_tokens & right_tokens) / \
+                len(left_tokens | right_tokens)
+        char_score = ResponseCache._char_ngram_jaccard(norm_a, norm_b, 3)
+        return 0.6 * token_score + 0.4 * char_score
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        normalized = re.sub(r"[^\w\s]", " ", text.lower())
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    @staticmethod
+    def _char_ngram_jaccard(a: str, b: str, n: int) -> float:
+        if len(a) < n or len(b) < n:
             return 0.0
-        return len(left & right) / len(left | right)
+        grams_a = {a[i: i + n] for i in range(len(a) - n + 1)}
+        grams_b = {b[i: i + n] for i in range(len(b) - n + 1)}
+        if not grams_a or not grams_b:
+            return 0.0
+        return len(grams_a & grams_b) / len(grams_a | grams_b)
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +156,8 @@ class SharedRedisCache:
         self.similarity_threshold = similarity_threshold
         self.prefix = prefix
         self.false_hit_log: list[dict[str, object]] = []
-        self._redis: Any = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+        self._redis: Any = redis_lib.Redis.from_url(
+            redis_url, decode_responses=True)
 
     def ping(self) -> bool:
         """Check Redis connectivity."""
@@ -146,7 +180,44 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+
+        try:
+            exact_key = f"{self.prefix}{self._query_hash(query)}"
+            exact_value = self._redis.hget(exact_key, "response")
+            if exact_value is not None:
+                return exact_value, 1.0
+
+            best_value: str | None = None
+            best_score = 0.0
+            best_query: str | None = None
+            for key in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(key, "query")
+                if not cached_query:
+                    continue
+                if _looks_like_false_hit(query, cached_query):
+                    score = ResponseCache.similarity(query, cached_query)
+                    self.false_hit_log.append(
+                        {"query": query, "cached_query": cached_query, "score": score}
+                    )
+                    continue
+                score = ResponseCache.similarity(query, cached_query)
+                if score > best_score:
+                    best_score = score
+                    best_value = self._redis.hget(key, "response")
+                    best_query = cached_query
+            if best_score >= self.similarity_threshold and best_value is not None:
+                if best_query and _looks_like_false_hit(query, best_query):
+                    self.false_hit_log.append(
+                        {"query": query, "cached_query": best_query,
+                            "score": best_score}
+                    )
+                    return None, best_score
+                return best_value, best_score
+            return None, best_score
+        except Exception:
+            return None, 0.0
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -157,7 +228,14 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        if _is_uncacheable(query):
+            return
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            self._redis.hset(key, mapping={"query": query, "response": value})
+            self._redis.expire(key, self.ttl_seconds)
+        except Exception:
+            return
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""

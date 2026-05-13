@@ -13,7 +13,7 @@ circuit_breaker:
   success_threshold: 1
 cache:
   enabled: true
-  backend: memory          # "memory" (default) or "redis" (requires docker compose up -d)
+  backend: memory # "memory" (default) or "redis" (requires docker compose up -d)
   ttl_seconds: 300
   similarity_threshold: 0.92
   redis_url: "redis://localhost:6379/0"
@@ -31,6 +31,9 @@ scenarios:
     description: "Primary provider fails 50% — circuit should oscillate"
     provider_overrides:
       primary: 0.5
+  - name: cache_stale_candidate
+    description: "Low-risk cache candidate to validate guardrails"
+    provider_overrides: {}
   - name: all_healthy
     description: "Baseline — both providers healthy"
     provider_overrides: {}
